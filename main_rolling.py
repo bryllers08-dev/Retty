@@ -33,11 +33,20 @@ AI ADVISOR (built-in, no external API needed)
       Logs: full reasoning + applied/rejected adjustments → advisor_log.txt
   • SAFE_BOUNDS enforced in code — AI cannot breach hard limits
 
-Railway deployment:
-  • pip install xgboost websockets   (add to requirements.txt)
-  • Mount a Volume at /app/data — all persisted files live there
-  • ENV: DERIV_API_TOKEN, XGB_THRESHOLD (default 0.70), BASE_STAKE,
-         TARGET_PROFIT, STOP_LOSS, COLLECT_HOURS, PERSIST_DIR
+Railway deployment (Supabase Storage backend):
+  • pip install xgboost websockets supabase   (add to requirements.txt)
+  • NO Volume needed — all files persist in Supabase Storage
+  • Create a Supabase project → Storage → create bucket: "botdata" (private)
+  • Create a service-role API key (Settings → API → service_role key)
+  • Set ENV vars in Railway:
+      DERIV_API_TOKEN      your Deriv token
+      SUPABASE_URL         https://xxxx.supabase.co
+      SUPABASE_KEY         your service_role key
+      SUPABASE_BUCKET      botdata   (or any bucket name you chose)
+      BASE_STAKE, TARGET_PROFIT, STOP_LOSS, COLLECT_HOURS, XGB_THRESHOLD
+  • On startup the bot pulls all persisted files from Supabase to /tmp/botdata
+  • After every write the file is also uploaded to Supabase automatically
+  • You can download any file directly from the Supabase Storage dashboard
 
 Run:
     python main_rolling.py                  # full run
@@ -69,6 +78,13 @@ try:
 except ImportError:
     sys.exit("websockets not installed — run: pip install websockets")
 
+# ── Supabase import (optional — falls back gracefully if not installed) ──────
+try:
+    from supabase import create_client as _supa_create
+    _SUPA_AVAILABLE = True
+except ImportError:
+    _SUPA_AVAILABLE = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,14 +96,18 @@ WS_URL      = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
 COLLECT_HOURS  = float(os.getenv("COLLECT_HOURS", "26"))
 COLLECT_SECS   = COLLECT_HOURS * 3600
 
-# ── Persistent storage — mount a Railway Volume at /app/data ─────────────────
-# In Railway: Settings → Volumes → Mount Path: /app/data
-# CAL_FILE and DATA_DIR will survive restarts/redeploys
-_PERSIST_DIR   = os.getenv("PERSIST_DIR", os.path.join(os.getcwd(), "data"))
+# ── Persistent storage — Supabase Storage (no Railway Volume needed) ──────────
+# Files are written to _PERSIST_DIR locally (in /tmp on Railway ephemeral FS)
+# and mirrored to Supabase Storage after every write so they survive restarts.
+# On startup, all files are pulled from Supabase before Phase 1/2 begins.
+SUPABASE_URL    = os.getenv("SUPABASE_URL",    "")
+SUPABASE_KEY    = os.getenv("SUPABASE_KEY",    "")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "botdata")
+_PERSIST_DIR    = os.getenv("PERSIST_DIR", os.path.join("/tmp", "botdata"))
 os.makedirs(_PERSIST_DIR, exist_ok=True)
-CAL_FILE       = os.path.join(_PERSIST_DIR, "calibration.json")
-DATA_DIR       = os.path.join(_PERSIST_DIR, "symbol_data")
-PORT           = int(os.getenv("PORT", "8080"))
+CAL_FILE        = os.path.join(_PERSIST_DIR, "calibration.json")
+DATA_DIR        = os.path.join(_PERSIST_DIR, "symbol_data")
+PORT            = int(os.getenv("PORT", "8080"))
 
 # Symbols to survey in Phase 1
 SURVEY_SYMBOLS = ["1HZ10V"]
@@ -99,8 +119,8 @@ MARTINGALE_STEPS  = int(os.getenv("MARTI_STEPS",     "4"))
 LOSS_COOLDOWN     = float(os.getenv("LOSS_COOLDOWN", "45"))
 
 # Trade risk
-TARGET_PROFIT  = float(os.getenv("TARGET_PROFIT", "100.0"))
-STOP_LOSS      = float(os.getenv("STOP_LOSS",     "30.0"))
+TARGET_PROFIT  = float(os.getenv("TARGET_PROFIT", "45.0"))
+STOP_LOSS      = float(os.getenv("STOP_LOSS",     "20.0"))
 LOCK_TIMEOUT   = 360   # 5-min contract + 60s buffer
 
 # ── ML gate ──────────────────────────────────────────────────────────────────
@@ -149,6 +169,157 @@ def info(m):  log.info(m)
 def warn(m):  log.warning(m)
 def err(m):   log.error(m)
 def tlog(m):  log.info(f"[TRADE] {m}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUPABASE STORAGE  — transparent mirror of _PERSIST_DIR to Supabase Storage
+# ─────────────────────────────────────────────────────────────────────────────
+
+class SupabaseStore:
+    """
+    Thin wrapper around Supabase Storage.
+
+    Every file the bot writes is also uploaded here automatically via
+    upload(). On startup, restore() pulls every file back down so the
+    bot picks up exactly where it left off after a Railway restart or
+    redeploy — no Volume needed.
+
+    File layout in the bucket (mirrors local _PERSIST_DIR layout):
+      calibration.json
+      advisor_log.txt
+      xgb_model.json
+      lr_model.pkl
+      iso_model.pkl
+      gb_model.pkl          (GBM fallback, may not exist)
+      symbol_data/1HZ10V.csv
+      symbol_data/<symbol>.csv
+
+    Falls back silently if SUPABASE_URL/KEY are missing or supabase
+    package not installed — bot runs in local-only mode.
+    """
+
+    def __init__(self):
+        self._client  = None
+        self._bucket  = SUPABASE_BUCKET
+        self._enabled = False
+
+        if not _SUPA_AVAILABLE:
+            warn("[SUPA] supabase package not installed — local-only mode")
+            return
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            warn("[SUPA] SUPABASE_URL / SUPABASE_KEY not set — local-only mode")
+            return
+        try:
+            self._client  = _supa_create(SUPABASE_URL, SUPABASE_KEY)
+            self._enabled = True
+            info(f"[SUPA] Connected  bucket={self._bucket}")
+        except Exception as exc:
+            warn(f"[SUPA] Init failed: {exc} — local-only mode")
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    # ── Upload one file ───────────────────────────────────────────────────────
+    def upload(self, local_path: str, remote_key: str = None):
+        """
+        Upload local_path to Supabase Storage.
+        remote_key defaults to the path relative to _PERSIST_DIR,
+        e.g. /tmp/botdata/symbol_data/1HZ10V.csv → symbol_data/1HZ10V.csv
+        """
+        if not self._enabled:
+            return
+        if not os.path.exists(local_path):
+            return
+        if remote_key is None:
+            remote_key = os.path.relpath(local_path, _PERSIST_DIR)
+        try:
+            with open(local_path, "rb") as f:
+                data = f.read()
+            # Try update first; if 404 fall back to upload (create)
+            try:
+                self._client.storage.from_(self._bucket).update(
+                    remote_key, data,
+                    file_options={"content-type": "application/octet-stream",
+                                  "upsert": "true"})
+            except Exception:
+                self._client.storage.from_(self._bucket).upload(
+                    remote_key, data,
+                    file_options={"content-type": "application/octet-stream",
+                                  "upsert": "true"})
+            info(f"[SUPA] ↑ uploaded {remote_key}  ({len(data):,} bytes)")
+        except Exception as exc:
+            warn(f"[SUPA] upload {remote_key} failed: {exc}")
+
+    # ── Download one file ─────────────────────────────────────────────────────
+    def download(self, remote_key: str, local_path: str) -> bool:
+        """Download remote_key → local_path. Returns True on success."""
+        if not self._enabled:
+            return False
+        try:
+            data = self._client.storage.from_(self._bucket).download(remote_key)
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            with open(local_path, "wb") as f:
+                f.write(data)
+            info(f"[SUPA] ↓ downloaded {remote_key}  ({len(data):,} bytes)")
+            return True
+        except Exception as exc:
+            # File may simply not exist yet on first run — not an error
+            if "not found" in str(exc).lower() or "404" in str(exc):
+                return False
+            warn(f"[SUPA] download {remote_key} failed: {exc}")
+            return False
+
+    # ── Restore all persisted files on startup ────────────────────────────────
+    def restore(self):
+        """
+        Pull every known file from Supabase to _PERSIST_DIR.
+        Called once at startup before Phase 1/2 begins.
+        Missing files are silently skipped (first run).
+        """
+        if not self._enabled:
+            return
+
+        KNOWN_FILES = [
+            "calibration.json",
+            "advisor_log.txt",
+            "xgb_model.json",
+            "lr_model.pkl",
+            "iso_model.pkl",
+            "gb_model.pkl",
+        ]
+        # Also restore symbol CSVs
+        try:
+            items = self._client.storage.from_(self._bucket).list("symbol_data")
+            for item in (items or []):
+                name = item.get("name", "")
+                if name.endswith(".csv"):
+                    KNOWN_FILES.append(f"symbol_data/{name}")
+        except Exception:
+            pass
+
+        restored = 0
+        for remote_key in KNOWN_FILES:
+            local_path = os.path.join(_PERSIST_DIR, remote_key)
+            if self.download(remote_key, local_path):
+                restored += 1
+
+        info(f"[SUPA] Restore complete — {restored}/{len(KNOWN_FILES)} files pulled")
+
+    # ── Upload all local files (sync push) ───────────────────────────────────
+    def push_all(self):
+        """Upload every file in _PERSIST_DIR to Supabase. Called on shutdown."""
+        if not self._enabled:
+            return
+        for root, _, files in os.walk(_PERSIST_DIR):
+            for fname in files:
+                local = os.path.join(root, fname)
+                key   = os.path.relpath(local, _PERSIST_DIR)
+                self.upload(local, key)
+
+
+# Singleton — used throughout
+_store = SupabaseStore()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SYMBOL STATS ENGINE  (used in Phase 1)
@@ -285,6 +456,9 @@ class SymbolStats:
         if self._rows_since_flush >= 300:
             self._csv_f.flush()
             self._rows_since_flush = 0
+            # Upload CSV snapshot to Supabase every 300 rows (~5 min of data)
+            _csv_path = os.path.join(DATA_DIR, f"{self.symbol}.csv")
+            _store.upload(_csv_path, f"symbol_data/{self.symbol}.csv")
 
         return row
 
@@ -331,6 +505,9 @@ class SymbolStats:
     def close(self):
         self._csv_f.flush()
         self._csv_f.close()
+        # Final upload — ensures the complete collection CSV is in Supabase
+        _csv_path = os.path.join(DATA_DIR, f"{self.symbol}.csv")
+        _store.upload(_csv_path, f"symbol_data/{self.symbol}.csv")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CALIBRATION  (Phase 1 → Phase 2 bridge)
@@ -450,6 +627,7 @@ def compute_calibration(summaries: List[dict]) -> dict:
         json.dump(cal, f, indent=2)
 
     info(f"Calibration saved to {CAL_FILE}")
+    _store.upload(CAL_FILE, "calibration.json")
     return cal
 
 
@@ -494,6 +672,7 @@ def rolling_csv_trim(symbol: str):
         w.writeheader()
         w.writerows(kept)
     os.replace(tmp, fpath)
+    _store.upload(fpath, f"symbol_data/{symbol}.csv")
 
     total = len(kept) + removed
     info(f"[ROLLING] {symbol}: trimmed {removed} rows older than "
@@ -1058,6 +1237,7 @@ class AIAdvisor:
         try:
             with open(ADVISOR_LOG, "a") as f:
                 f.write(block + "\n")
+            _store.upload(ADVISOR_LOG, "advisor_log.txt")
         except Exception as exc:
             warn(f"[ADVISOR] log write failed: {exc}")
 
@@ -1514,6 +1694,7 @@ def retrain_ensemble(cal: dict):
         xgb.fit(X, y, verbose=False)
         out = os.path.join(_PERSIST_DIR, "xgb_model.json")
         xgb.save_model(out)
+        _store.upload(out, "xgb_model.json")
         probs = xgb.predict_proba(X)[:, 1]
         mask  = probs >= XGB_THRESHOLD
         n_sig = mask.sum()
@@ -1536,6 +1717,7 @@ def retrain_ensemble(cal: dict):
             out = os.path.join(_PERSIST_DIR, "gb_model.pkl")
             with open(out, 'wb') as f:
                 pickle.dump(gbm, f)
+            _store.upload(out, "gb_model.pkl")
             probs = gbm.predict_proba(X)[:, 1]
             mask  = probs >= XGB_THRESHOLD
             n_sig = mask.sum()
@@ -1568,6 +1750,7 @@ def retrain_ensemble(cal: dict):
         out = os.path.join(_PERSIST_DIR, "lr_model.pkl")
         with open(out, 'wb') as f:
             pickle.dump(lr_pipe, f)
+        _store.upload(out, "lr_model.pkl")
     except Exception as e:
         warn(f"[ENS] L2 LogReg failed: {e}")
 
@@ -1596,6 +1779,7 @@ def retrain_ensemble(cal: dict):
         out = os.path.join(_PERSIST_DIR, "iso_model.pkl")
         with open(out, 'wb') as f:
             pickle.dump(iso, f)
+        _store.upload(out, "iso_model.pkl")
     except Exception as e:
         warn(f"[ENS] L3 IsoForest failed: {e}")
 
@@ -2355,6 +2539,10 @@ def start_health_server(traders: List[SymbolTrader], phase: str,
                         "stake":    r.stake,
                         "locked":   t.waiting,
                     })
+                data["supabase"] = {
+                    "enabled": _store.enabled,
+                    "bucket":  SUPABASE_BUCKET if _store.enabled else None,
+                }
                 body = json.dumps(data, indent=2).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -2428,6 +2616,10 @@ async def main():
         if arg.startswith("--collect-hours="):
             global COLLECT_SECS
             COLLECT_SECS = float(arg.split("=")[1]) * 3600
+
+    # ── Pull persisted files from Supabase on every startup ──────────────────
+    info("[SUPA] Restoring persisted files from Supabase...")
+    _store.restore()   # no-op if Supabase not configured
 
     # ── Phase 1 ───────────────────────────────────────────────────────────────
     if os.path.exists(CAL_FILE) and not trade_only:
@@ -2556,7 +2748,10 @@ async def main():
         for task in trader_tasks + [recal_task]:
             task.cancel()
         await asyncio.gather(*trader_tasks, recal_task, return_exceptions=True)
-        info("All traders stopped. Exiting.")
+        info("All traders stopped.")
+        info("[SUPA] Final sync — pushing all local files to Supabase...")
+        _store.push_all()
+        info("Exiting.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
