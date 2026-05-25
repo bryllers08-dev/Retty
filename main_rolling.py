@@ -77,7 +77,7 @@ API_TOKEN   = os.getenv("DERIV_API_TOKEN", "iCCn0vuMCzLcq1J")
 APP_ID      = os.getenv("DERIV_APP_ID",    "1089")
 WS_URL      = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
 
-COLLECT_HOURS  = float(os.getenv("COLLECT_HOURS", "4"))
+COLLECT_HOURS  = float(os.getenv("COLLECT_HOURS", "26"))
 COLLECT_SECS   = COLLECT_HOURS * 3600
 
 # ── Persistent storage — mount a Railway Volume at /app/data ─────────────────
@@ -94,12 +94,12 @@ SURVEY_SYMBOLS = ["1HZ10V"]
 
 # Martingale
 BASE_STAKE        = float(os.getenv("BASE_STAKE",    "1.0"))
-MARTINGALE_MULT   = float(os.getenv("MARTI_MULT",    "4.45"))
-MARTINGALE_STEPS  = int(os.getenv("MARTI_STEPS",     "3"))
+MARTINGALE_MULT   = float(os.getenv("MARTI_MULT",    "1.25"))
+MARTINGALE_STEPS  = int(os.getenv("MARTI_STEPS",     "4"))
 LOSS_COOLDOWN     = float(os.getenv("LOSS_COOLDOWN", "45"))
 
 # Trade risk
-TARGET_PROFIT  = float(os.getenv("TARGET_PROFIT", "10.0"))
+TARGET_PROFIT  = float(os.getenv("TARGET_PROFIT", "100.0"))
 STOP_LOSS      = float(os.getenv("STOP_LOSS",     "30.0"))
 LOCK_TIMEOUT   = 360   # 5-min contract + 60s buffer
 
